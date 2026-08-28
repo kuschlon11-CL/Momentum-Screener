@@ -18,7 +18,7 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("Momentum Leader Screener V1.1")
+st.title("Momentum Leader Screener V1.4")
 st.caption(
     "US-Aktien nach Trendqualität, relativer Stärke und Widerstandsfähigkeit "
     "gegenüber einem Benchmark filtern und ranken."
@@ -37,6 +37,8 @@ with st.expander("Was dieser Screener misst", expanded=False):
         - relative Performance zum Benchmark
         - Veränderung der RS-Linie (Aktie / Benchmark)
         - „Red-Day Hold“: Wie oft schlägt die Aktie den Benchmark an dessen Verlusttagen?
+        - ADR20: durchschnittliche tägliche Handelsspanne der letzten 20 Handelstage
+        - Kursbewegung über die letzten 5 Handelstage
         - eigener Momentum Score von 0–100
 
         **Hinweis:** Das RS-Perzentil ist eine eigene, transparente Berechnung dieser App
@@ -63,6 +65,9 @@ class Settings:
     min_above_52w_low_pct: float
     min_red_day_hold_pct: float
     min_week_rel_pct: float
+    min_adr20_pct: float
+    min_week_move_pct: float
+    only_positive_week: bool
     require_template: bool
 
 
@@ -139,11 +144,18 @@ def _nasdaq_page(offset: int, limit: int = 1000) -> dict:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_nasdaq_universe() -> list[dict]:
-    """Load the public Nasdaq stock screener table with defensive pagination."""
+    """
+    Load Nasdaq screener rows and guarantee one row per ticker.
+
+    Nasdaq's public endpoint can ignore/handle offsets inconsistently on some
+    cloud requests. Therefore we request a large first page, track symbols
+    already seen, and stop if a later page contains no new tickers.
+    """
     rows: list[dict] = []
+    seen_symbols: set[str] = set()
     offset = 0
-    page_size = 1000
-    max_pages = 12
+    page_size = 10000
+    max_pages = 5
 
     for _ in range(max_pages):
         payload = _nasdaq_page(offset=offset, limit=page_size)
@@ -151,12 +163,26 @@ def _load_nasdaq_universe() -> list[dict]:
         page_rows = data.get("rows") or []
         if not page_rows:
             break
-        rows.extend(page_rows)
+
+        new_on_page = 0
+        for row in page_rows:
+            symbol = str(row.get("symbol") or "").strip().upper()
+            if not symbol or symbol in seen_symbols:
+                continue
+            seen_symbols.add(symbol)
+            rows.append(row)
+            new_on_page += 1
+
+        # Critical protection: if Nasdaq returned the same page again, do not
+        # add duplicates and do not continue paging forever.
+        if new_on_page == 0:
+            break
 
         total_raw = data.get("totalrecords", data.get("totalRecords"))
         total = int(_parse_number(total_raw, 0) or 0)
         offset += len(page_rows)
-        if len(page_rows) < page_size or (total and offset >= total):
+
+        if len(page_rows) < page_size or (total and len(seen_symbols) >= total):
             break
 
     return rows
@@ -177,7 +203,7 @@ def discover_symbols(settings: Settings) -> Tuple[List[str], Dict[str, dict]]:
             f"Technischer Fehler: {exc}"
         ) from exc
 
-    candidates = []
+    candidate_caps: Dict[str, float] = {}
     meta: Dict[str, dict] = {}
 
     for i, row in enumerate(rows, start=1):
@@ -208,8 +234,9 @@ def discover_symbols(settings: Settings) -> Tuple[List[str], Dict[str, dict]]:
             "volume": _parse_number(row.get("volume")),
             "country": row.get("country") or "",
         }
+        # One record per ticker, even if the upstream endpoint repeats rows.
         meta[symbol] = item
-        candidates.append((symbol, market_cap if not np.isnan(market_cap) else -1.0))
+        candidate_caps[symbol] = market_cap if not np.isnan(market_cap) else -1.0
 
         if i % 1000 == 0:
             progress.progress(
@@ -217,8 +244,8 @@ def discover_symbols(settings: Settings) -> Tuple[List[str], Dict[str, dict]]:
                 text=f"{i}/{len(rows)} Nasdaq-Screener-Zeilen geprüft …",
             )
 
-    # Analyse the largest names first. The final liquidity filter uses actual 50-day volume.
-    candidates.sort(key=lambda x: x[1], reverse=True)
+    # Analyse the largest unique names first. The final liquidity filter uses actual 50-day volume.
+    candidates = sorted(candidate_caps.items(), key=lambda x: x[1], reverse=True)
     symbols = [s for s, _ in candidates[: settings.max_universe]]
     progress.empty()
 
@@ -251,12 +278,14 @@ def get_field_frame(raw: pd.DataFrame, field: str, tickers: List[str]) -> pd.Dat
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def download_prices(tickers_tuple: tuple, benchmark: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def download_prices(tickers_tuple: tuple, benchmark: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     tickers = list(tickers_tuple)
     all_tickers = list(dict.fromkeys(tickers + [benchmark]))
 
     close_parts = []
     volume_parts = []
+    high_parts = []
+    low_parts = []
     batch_size = 100
 
     for i in range(0, len(all_tickers), batch_size):
@@ -281,13 +310,19 @@ def download_prices(tickers_tuple: tuple, benchmark: str) -> Tuple[pd.DataFrame,
             ) from exc
         close_parts.append(get_field_frame(raw, "Close", batch))
         volume_parts.append(get_field_frame(raw, "Volume", batch))
+        high_parts.append(get_field_frame(raw, "High", batch))
+        low_parts.append(get_field_frame(raw, "Low", batch))
 
     close = pd.concat(close_parts, axis=1)
     volume = pd.concat(volume_parts, axis=1)
+    high = pd.concat(high_parts, axis=1)
+    low = pd.concat(low_parts, axis=1)
 
     close = close.loc[:, ~close.columns.duplicated()].sort_index()
     volume = volume.loc[:, ~volume.columns.duplicated()].sort_index()
-    return close, volume
+    high = high.loc[:, ~high.columns.duplicated()].sort_index()
+    low = low.loc[:, ~low.columns.duplicated()].sort_index()
+    return close, volume, high, low
 
 
 def calc_metrics(
@@ -295,6 +330,8 @@ def calc_metrics(
     stock: pd.Series,
     bench: pd.Series,
     volume: pd.Series,
+    high: pd.Series,
+    low: pd.Series,
     meta: dict,
 ) -> dict | None:
     pair = pd.concat(
@@ -307,6 +344,19 @@ def calc_metrics(
     s = pair["stock"]
     b = pair["bench"]
     current = float(s.iloc[-1])
+
+    # Daily-move filters.
+    one_day_move = pct_return(s, 1)
+
+    hl = pd.concat(
+        [high.rename("high"), low.rename("low"), stock.rename("close")], axis=1
+    ).dropna()
+    if len(hl) >= 20:
+        # Average Daily Range over 20 sessions as % of that day's close.
+        daily_range_pct = ((hl["high"] - hl["low"]) / hl["close"].replace(0, np.nan)) * 100.0
+        adr20 = float(daily_range_pct.iloc[-20:].mean())
+    else:
+        adr20 = np.nan
 
     sma50 = float(s.rolling(50).mean().iloc[-1])
     sma150 = float(s.rolling(150).mean().iloc[-1])
@@ -394,6 +444,8 @@ def calc_metrics(
         "Price": current,
         "Market Cap ($B)": market_cap_b,
         "Avg Vol 50D": avg_vol_50,
+        "1D %": one_day_move,
+        "ADR20 %": adr20,
         "5D %": r5,
         "21D %": r21,
         "63D %": r63,
@@ -464,6 +516,16 @@ def apply_filters(df: pd.DataFrame, settings: Settings) -> pd.DataFrame:
     out = out[out["Price"] >= settings.min_price]
     out = out[out["Avg Vol 50D"] >= settings.min_avg_volume]
 
+    # Only stocks that actually have enough daily movement.
+    out = out[out["ADR20 %"] >= settings.min_adr20_pct]
+
+    # Weekly momentum filter: close-to-close movement over the last 5 trading sessions.
+    if settings.min_week_move_pct > 0:
+        if settings.only_positive_week:
+            out = out[out["5D %"] >= settings.min_week_move_pct]
+        else:
+            out = out[out["5D %"].abs() >= settings.min_week_move_pct]
+
     out = out[out["RS percentile"] >= settings.min_rs_percentile]
     out = out[out["% below 52W high"] >= -settings.max_below_52w_high_pct]
     out = out[out["% above 52W low"] >= settings.min_above_52w_low_pct]
@@ -474,8 +536,8 @@ def apply_filters(df: pd.DataFrame, settings: Settings) -> pd.DataFrame:
         out = out[out["Minervini Template"]]
 
     return out.sort_values(
-        ["Momentum Score", "RS percentile", "5D vs Bench %"],
-        ascending=[False, False, False],
+        ["Momentum Score", "ADR20 %", "RS percentile", "5D vs Bench %"],
+        ascending=[False, False, False, False],
     )
 
 
@@ -516,6 +578,34 @@ with st.sidebar:
         max_value=4000,
         value=1000,
         step=100,
+    )
+
+    st.divider()
+    st.subheader("Wochenbewegung / Volatilität")
+
+    min_adr20_pct = st.slider(
+        "Min. ADR20 – durchschnittliche Tagesrange (%)",
+        min_value=0.0,
+        max_value=15.0,
+        value=3.0,
+        step=0.5,
+        help="Durchschnitt von (Tageshoch - Tagestief) / Schlusskurs über die letzten 20 Handelstage. "
+             "Je höher, desto bewegungsfreudiger die Aktie.",
+    )
+    min_week_move_pct = st.slider(
+        "Min. Kursbewegung der letzten 5 Handelstage (%)",
+        min_value=0.0,
+        max_value=30.0,
+        value=5.0,
+        step=0.5,
+        help="5 % bedeutet: Die Aktie muss vom Schlusskurs vor fünf Handelstagen "
+             "bis zum aktuellen Schlusskurs mindestens 5 % gestiegen sein. "
+             "0 % schaltet diesen Filter aus.",
+    )
+    only_positive_week = st.checkbox(
+        "Nur positive Wochenbewegungen",
+        value=True,
+        help="Aktiviert: z. B. +5 % oder mehr. Deaktiviert: auch -5 % oder weniger.",
     )
 
     st.divider()
@@ -572,6 +662,9 @@ settings = Settings(
     min_above_52w_low_pct=float(min_above_52w_low_pct),
     min_red_day_hold_pct=float(min_red_day_hold_pct),
     min_week_rel_pct=float(min_week_rel_pct),
+    min_adr20_pct=float(min_adr20_pct),
+    min_week_move_pct=float(min_week_move_pct),
+    only_positive_week=bool(only_positive_week),
     require_template=bool(require_template),
 )
 
@@ -582,9 +675,9 @@ if scan:
             st.error("Kein Ausgangsuniversum gefunden. Filter lockern oder später erneut versuchen.")
             st.stop()
 
-        st.info(f"{len(symbols)} Aktien gefunden. Lade Kursdaten und berechne Momentum …")
+        st.info(f"{len(symbols)} eindeutige Aktien gefunden. Lade Kursdaten und berechne Momentum …")
 
-        close, volume = download_prices(tuple(symbols), settings.benchmark)
+        close, volume, high, low = download_prices(tuple(symbols), settings.benchmark)
         if settings.benchmark not in close.columns:
             st.error(f"Benchmark {settings.benchmark} konnte nicht geladen werden.")
             st.stop()
@@ -597,11 +690,15 @@ if scan:
             if symbol not in close.columns:
                 continue
             vol = volume[symbol] if symbol in volume.columns else pd.Series(dtype=float)
+            hi = high[symbol] if symbol in high.columns else pd.Series(dtype=float)
+            lo = low[symbol] if symbol in low.columns else pd.Series(dtype=float)
             metrics = calc_metrics(
                 symbol,
                 close[symbol],
                 bench,
                 vol,
+                hi,
+                lo,
                 metadata.get(symbol, {}),
             )
             if metrics is not None:
@@ -612,7 +709,15 @@ if scan:
 
         bar.empty()
 
-        full = add_cross_sectional_scores(pd.DataFrame(rows))
+        metrics_df = pd.DataFrame(rows)
+        if metrics_df.empty:
+            st.error("Es konnten keine Aktien mit ausreichender Kurshistorie ausgewertet werden.")
+            st.stop()
+
+        # Final safety net: no ticker can appear more than once in the ranking.
+        metrics_df = metrics_df.drop_duplicates(subset=["Ticker"], keep="first").reset_index(drop=True)
+
+        full = add_cross_sectional_scores(metrics_df)
         filtered = apply_filters(full, settings)
 
         st.session_state["momentum_full"] = full
@@ -649,7 +754,7 @@ if "momentum_filtered" in st.session_state:
         show = filtered.drop(columns=["_rules", "RS composite"], errors="ignore").copy()
 
         numeric_cols = [
-            "Price", "Market Cap ($B)", "Avg Vol 50D", "5D %", "21D %",
+            "Price", "Market Cap ($B)", "Avg Vol 50D", "1D %", "ADR20 %", "5D %", "21D %",
             "63D %", "126D %", "252D %", "5D vs Bench %", "21D vs Bench %",
             "63D vs Bench %", "126D vs Bench %", "252D vs Bench %",
             "RS line 63D %", "Red-Day Hold %", "Down-day alpha avg %",
@@ -662,7 +767,7 @@ if "momentum_filtered" in st.session_state:
 
         preferred = [
             "Ticker", "Name", "Momentum Score", "RS percentile",
-            "Minervini Template", "5D vs Bench %", "21D vs Bench %",
+            "Minervini Template", "5D %", "5D vs Bench %", "ADR20 %", "21D vs Bench %",
             "Red-Day Hold %", "RS line 63D %", "% below 52W high",
             "Market Cap ($B)", "Price", "Sector", "Exchange",
             "5D %", "21D %", "63D %", "126D %", "252D %",
@@ -690,11 +795,12 @@ if "momentum_filtered" in st.session_state:
         selected = st.selectbox("Aktie auswählen", filtered["Ticker"].tolist())
         row = filtered.loc[filtered["Ticker"] == selected].iloc[0]
 
-        d1, d2, d3, d4 = st.columns(4)
+        d1, d2, d3, d4, d5 = st.columns(5)
         d1.metric("Momentum Score", f'{row["Momentum Score"]:.1f}/100')
         d2.metric("RS-Perzentil", f'{row["RS percentile"]:.0f}/99')
-        d3.metric("5T vs Benchmark", f'{row["5D vs Bench %"]:+.2f}%')
-        d4.metric("Red-Day Hold", f'{row["Red-Day Hold %"]:.1f}%')
+        d3.metric("5T Bewegung", f'{row["5D %"]:+.2f}%')
+        d4.metric("ADR20", f'{row["ADR20 %"]:.2f}%')
+        d5.metric("Red-Day Hold", f'{row["Red-Day Hold %"]:.1f}%')
 
         if selected in close.columns:
             s = close[selected].dropna().iloc[-300:]
