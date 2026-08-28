@@ -1,5 +1,7 @@
 import math
 import time
+import re
+import requests
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
@@ -8,7 +10,6 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
-from yfinance import EquityQuery
 
 
 st.set_page_config(
@@ -17,7 +18,7 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("Momentum Leader Screener V1")
+st.title("Momentum Leader Screener V1.1")
 st.caption(
     "US-Aktien nach Trendqualität, relativer Stärke und Widerstandsfähigkeit "
     "gegenüber einem Benchmark filtern und ranken."
@@ -44,9 +45,9 @@ with st.expander("Was dieser Screener misst", expanded=False):
     )
 
 st.warning(
-    "Datenquelle in V1: yfinance/Yahoo Finance. Geeignet für persönliche Research- und "
-    "Prototyping-Zwecke; kein garantierter Echtzeit-/Institutional-Feed. "
-    "Keine Anlageberatung."
+    "V1.1: Das Aktienuniversum kommt aus dem Nasdaq Stock Screener; historische "
+    "Tageskurse werden für die technische Analyse über yfinance geladen. "
+    "Kein garantierter Echtzeit-/Institutional-Feed. Keine Anlageberatung."
 )
 
 
@@ -85,65 +86,148 @@ def safe_float(x, default=np.nan):
         return default
 
 
+def _parse_number(value, default=np.nan):
+    """Parse Nasdaq screener values such as '$1,234.5', '12,345' or 'N/A'."""
+    if value is None:
+        return default
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value)
+    text = str(value).strip()
+    if not text or text.upper() in {"N/A", "NA", "NONE", "NULL", "--"}:
+        return default
+    text = text.replace("$", "").replace(",", "").replace("%", "").strip()
+    mult = 1.0
+    if text[-1:].upper() == "T":
+        mult, text = 1e12, text[:-1]
+    elif text[-1:].upper() == "B":
+        mult, text = 1e9, text[:-1]
+    elif text[-1:].upper() == "M":
+        mult, text = 1e6, text[:-1]
+    elif text[-1:].upper() == "K":
+        mult, text = 1e3, text[:-1]
+    try:
+        return float(text) * mult
+    except Exception:
+        return default
+
+
+def _nasdaq_page(offset: int, limit: int = 1000) -> dict:
+    url = "https://api.nasdaq.com/api/screener/stocks"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.nasdaq.com/market-activity/stocks/screener",
+        "Origin": "https://www.nasdaq.com",
+    }
+    params = {
+        "tableonly": "true",
+        "limit": int(limit),
+        "offset": int(offset),
+        "download": "true",
+    }
+    response = requests.get(url, params=params, headers=headers, timeout=25)
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict) or not payload.get("data"):
+        raise RuntimeError("Nasdaq lieferte keine Screener-Daten.")
+    return payload
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_nasdaq_universe() -> list[dict]:
+    """Load the public Nasdaq stock screener table with defensive pagination."""
+    rows: list[dict] = []
+    offset = 0
+    page_size = 1000
+    max_pages = 12
+
+    for _ in range(max_pages):
+        payload = _nasdaq_page(offset=offset, limit=page_size)
+        data = payload.get("data") or {}
+        page_rows = data.get("rows") or []
+        if not page_rows:
+            break
+        rows.extend(page_rows)
+
+        total_raw = data.get("totalrecords", data.get("totalRecords"))
+        total = int(_parse_number(total_raw, 0) or 0)
+        offset += len(page_rows)
+        if len(page_rows) < page_size or (total and offset >= total):
+            break
+
+    return rows
+
+
 def discover_symbols(settings: Settings) -> Tuple[List[str], Dict[str, dict]]:
     """
-    Yahoo's EquityQuery is used as a coarse first pass, so we do not need a
-    user-supplied TradingView watchlist.
+    Build the US-stock universe from Nasdaq's public Stock Screener instead of
+    Yahoo's authenticated screener endpoint (which can return HTTP 401 on cloud hosts).
     """
-    exchanges = ["NMS", "NYQ", "NGM", "NCM", "ASE"]
-    query = EquityQuery("and", [
-        EquityQuery("eq", ["region", "us"]),
-        EquityQuery("is-in", ["exchange", *exchanges]),
-        EquityQuery("gte", ["intradaymarketcap", settings.min_market_cap_b * 1e9]),
-        EquityQuery("gte", ["intradayprice", settings.min_price]),
-        EquityQuery("gte", ["avgdailyvol3m", settings.min_avg_volume]),
-    ])
+    progress = st.progress(0, text="Aktienuniversum wird über Nasdaq aufgebaut …")
+    try:
+        rows = _load_nasdaq_universe()
+    except Exception as exc:
+        progress.empty()
+        raise RuntimeError(
+            "Nasdaq-Aktienuniversum konnte nicht geladen werden. "
+            f"Technischer Fehler: {exc}"
+        ) from exc
 
-    symbols: List[str] = []
+    candidates = []
     meta: Dict[str, dict] = {}
-    offset = 0
-    batch_size = 250
 
-    progress = st.progress(0, text="Aktienuniversum wird aufgebaut …")
+    for i, row in enumerate(rows, start=1):
+        symbol = str(row.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
 
-    while len(symbols) < settings.max_universe:
-        size = min(batch_size, settings.max_universe - len(symbols))
-        try:
-            response = yf.screen(
-                query,
-                offset=offset,
-                size=size,
-                sortField="intradaymarketcap",
-                sortAsc=False,
+        # Avoid obvious non-standard symbols that Yahoo's chart endpoint often rejects.
+        if any(ch in symbol for ch in ["^", "/", " "]):
+            continue
+
+        market_cap = _parse_number(row.get("marketCap"))
+        price = _parse_number(row.get("lastsale", row.get("lastSale")))
+
+        if not np.isnan(market_cap) and market_cap < settings.min_market_cap_b * 1e9:
+            continue
+        if not np.isnan(price) and price < settings.min_price:
+            continue
+
+        item = {
+            "symbol": symbol,
+            "shortName": row.get("name") or "",
+            "marketCap": market_cap,
+            "intradayprice": price,
+            "sector": row.get("sector") or "",
+            "industry": row.get("industry") or "",
+            "exchange": row.get("exchange") or "",
+            "volume": _parse_number(row.get("volume")),
+            "country": row.get("country") or "",
+        }
+        meta[symbol] = item
+        candidates.append((symbol, market_cap if not np.isnan(market_cap) else -1.0))
+
+        if i % 1000 == 0:
+            progress.progress(
+                min(i / max(len(rows), 1), 1.0),
+                text=f"{i}/{len(rows)} Nasdaq-Screener-Zeilen geprüft …",
             )
-        except Exception as exc:
-            raise RuntimeError(f"Yahoo-Screener konnte nicht geladen werden: {exc}") from exc
 
-        quotes = response.get("quotes", []) if isinstance(response, dict) else []
-        if not quotes:
-            break
-
-        for q in quotes:
-            symbol = q.get("symbol")
-            if not symbol:
-                continue
-            quote_type = str(q.get("quoteType", "")).upper()
-            if quote_type and quote_type != "EQUITY":
-                continue
-            if symbol not in meta:
-                symbols.append(symbol)
-                meta[symbol] = q
-
-        offset += len(quotes)
-        progress.progress(
-            min(len(symbols) / max(settings.max_universe, 1), 1.0),
-            text=f"{len(symbols)} Aktien im Ausgangsuniversum …",
-        )
-        if len(quotes) < size:
-            break
-
+    # Analyse the largest names first. The final liquidity filter uses actual 50-day volume.
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    symbols = [s for s, _ in candidates[: settings.max_universe]]
     progress.empty()
-    return symbols[: settings.max_universe], meta
+
+    if not symbols:
+        raise RuntimeError(
+            "Das Nasdaq-Aktienuniversum wurde geladen, aber nach den Vorfiltern blieb keine Aktie übrig."
+        )
+
+    return symbols, meta
 
 
 def get_field_frame(raw: pd.DataFrame, field: str, tickers: List[str]) -> pd.DataFrame:
@@ -177,16 +261,24 @@ def download_prices(tickers_tuple: tuple, benchmark: str) -> Tuple[pd.DataFrame,
 
     for i in range(0, len(all_tickers), batch_size):
         batch = all_tickers[i:i + batch_size]
-        raw = yf.download(
-            batch,
-            period="2y",
-            interval="1d",
-            auto_adjust=True,
-            group_by="ticker",
-            threads=True,
-            progress=False,
-            timeout=20,
-        )
+        try:
+            raw = yf.download(
+                batch,
+                period="2y",
+                interval="1d",
+                auto_adjust=True,
+                group_by="ticker",
+                threads=False,
+                progress=False,
+                timeout=25,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Historische Kursdaten konnten nicht geladen werden. "
+                "Falls Yahoo auch den Chart-Download auf Streamlit blockiert, "
+                "stellen wir die Kursquelle in der nächsten Stufe auf einen API-Feed um. "
+                f"Technischer Fehler: {exc}"
+            ) from exc
         close_parts.append(get_field_frame(raw, "Close", batch))
         volume_parts.append(get_field_frame(raw, "Volume", batch))
 
@@ -365,6 +457,12 @@ def add_cross_sectional_scores(df: pd.DataFrame) -> pd.DataFrame:
 
 def apply_filters(df: pd.DataFrame, settings: Settings) -> pd.DataFrame:
     out = df.copy()
+
+    # These are enforced again here because V1.1 no longer relies on Yahoo EquityQuery.
+    if "Market Cap ($B)" in out.columns:
+        out = out[(out["Market Cap ($B)"].isna()) | (out["Market Cap ($B)"] >= settings.min_market_cap_b)]
+    out = out[out["Price"] >= settings.min_price]
+    out = out[out["Avg Vol 50D"] >= settings.min_avg_volume]
 
     out = out[out["RS percentile"] >= settings.min_rs_percentile]
     out = out[out["% below 52W high"] >= -settings.max_below_52w_high_pct]
