@@ -18,7 +18,7 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("Momentum Leader Screener V1.4")
+st.title("Momentum Leader Screener V1.5")
 st.caption(
     "US-Aktien nach Trendqualität, relativer Stärke und Widerstandsfähigkeit "
     "gegenüber einem Benchmark filtern und ranken."
@@ -770,9 +770,12 @@ if "momentum_filtered" in st.session_state:
             "Minervini Template", "5D %", "5D vs Bench %", "ADR20 %", "21D vs Bench %",
             "Red-Day Hold %", "RS line 63D %", "% below 52W high",
             "Market Cap ($B)", "Price", "Sector", "Exchange",
-            "5D %", "21D %", "63D %", "126D %", "252D %",
+            "21D %", "63D %", "126D %", "252D %",
         ]
-        preferred = [c for c in preferred if c in show.columns]
+
+        # Defensive deduplication: Streamlit/Arrow requires unique column names.
+        preferred = list(dict.fromkeys(c for c in preferred if c in show.columns))
+        show = show.loc[:, ~show.columns.duplicated()].copy()
         rest = [c for c in show.columns if c not in preferred]
         show = show[preferred + rest]
 
